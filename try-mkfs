@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# The block device to use
+DEV=sdb1
+
+# Uncomment to use valgrind
+#export VALGRIND="valgrind --trace-children=yes --leak-check=full"
+
+# Uncomment to do IO counting
+#export IO_COUNT='LD_PRELOAD=$WD/tools/io_count.so'
+
+# Uncomment to enable patchgroup traces on the tests
+#PERF_TRACE="PATCHGROUP_TRACE=perf.pgt"
+#BLOB_TRACE="PATCHGROUP_TRACE=blob.pgt"
+#TEST_TRACE="PATCHGROUP_TRACE=test.pgt"
+#DEMO_TRACE="PATCHGROUP_TRACE=demo.pgt"
+#HAND_TRACE="PATCHGROUP_TRACE=hand.pgt"
+#SYSJ_TRACE="PATCHGROUP_TRACE=sysj.pgt"
+
+# Uncomment to enable oprofile
+#OPROF="LD_LIBRARY_PATH=/usr/lib/debug"
+
+# Uncomment to use Featherstitch journal mode
+#JOURNAL=use_journal=1
+
+# Uncomment to use death testing
+#DEATH="0 20000"
+
+if [ -h fstitch ]
+then
+	FSTYPE="ext2"
+	MKFS_ARGS=""
+else
+	FSTYPE="ext3"
+	MKFS_ARGS="-j"
+	[ "$PERF_TRACE" -o "$BLOB_TRACE" -o "$TEST_TRACE" -o \
+	  "$DEMO_TRACE" -o "$HAND_TRACE" -o "$SYSJ_TRACE" -o \
+	  "$JOURNAL" ] && echo "Warning: ignoring Featherstitch-specific option (not using Featherstitch)"
+fi
+
+make || exit $?
+if [ "$DEATH" ]
+then
+	make -C reboot || exit $?
+	# TODO: add escaped quote marks in case pwd has spaces
+	DEATH="`echo death command "$(pwd)/reboot/reboot"; echo death $DEATH; echo " "`"
+fi
+
+HOST="`hostname`"
+if [ "${HOST#kudos-}" == "$HOST" -a "$HOST" != "execl" -a "$HOST" != "butters" ]
+then
+	echo "Not running on a kudos-* test machine, won't overwrite your file systems."
+	exit 1
+fi
+
+if mount | grep -q "on /mnt/test"
+then
+	echo "/mnt/test is mounted; unmount before running this script."
+	exit 1
+fi
+
+echo -n "Creating file system... "
+sudo mke2fs $MKFS_ARGS -m 0 -b 4096 /dev/$DEV &> /dev/null
+sudo mount /dev/$DEV /mnt/test -t $FSTYPE
+sudo chown -R `whoami` /mnt/test
+[ "$JOURNAL" ] && dd if=/dev/zero of=/mnt/test/.journal bs=1M count=64 2> /dev/null
+cp demo /mnt/test
+cat > /mnt/test/tests << EOF
+tx
+info
+dtable
+rollover
+rollover -b
+rollover -b -r
+abort
+#abort perf
+#abort perf temp
+rwatx
+#rwatx perf
+exdtable
+#exdtable perf
+odtable
+ussdtable
+bfdtable
+#bfdtable metrics
+#oracle
+#oracle bloom
+sidtable
+didtable
+kddtable
+#kddtable perf
+udtable
+#udtable perf
+ctable
+cctable
+stable
+iterator
+blob_cmp
+#tpchtype row
+#tpchgen
+#tpchtest
+#bdbtest
+#consistency
+#consistency check
+#durability
+#durability check
+EOF
+mkdir /mnt/test/journals
+ln -s "`pwd`/tpch" /mnt/test
+echo "done."
+
+if [ "$FSTYPE" == "ext2" ]
+then
+	sudo umount /mnt/test
+	echo -n "Loading Featherstitch... "
+	sudo insmod fstitch/kfstitchd.ko device=/dev/sdb $JOURNAL
+	[ -f /proc/kfstitchd_debug ] && (cat /proc/kfstitchd_debug > try.fdb &) || rm -f try.fdb
+	sudo mount /mnt/test
+	echo "done."
+fi
+
+if [ "$OPROF" ]
+then
+	sudo opcontrol --init
+	sudo opcontrol --reset
+	sudo opcontrol "--vmlinux=/usr/src/linux-`uname -r`/vmlinux"
+	sudo opcontrol --start
+fi
+
+# Run the performance test
+echo "${DEATH}performance seek" | (WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $PERF_TRACE exec $VALGRIND '"$WD/anvil"')
+find /mnt/test -type f -print0 | xargs -0 ls -l
+
+if [ "$OPROF" ]
+then
+	sudo opcontrol --shutdown
+	sudo opcontrol --deinit
+	opreport --symbols main > oprofile
+else
+	rm -f oprofile
+fi
+
+if [ ! -f /mnt/test/core ]
+then
+	# Run the blob_cmp performance test
+	echo "${DEATH}blob_cmp perf" | (WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $BLOB_TRACE exec $VALGRIND '"$WD/anvil"')
+	find /mnt/test -type f -print0 | xargs -0 ls -l
+	
+	if [ ! -f /mnt/test/core ]
+	then
+		# Run some tests
+		echo "${DEATH}script tests" | (WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $TEST_TRACE exec $VALGRIND '"$WD/anvil"')
+		find /mnt/test -type f -print0 | xargs -0 ls -l
+		
+		# Run the old demo
+		#echo "script demo" | (WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $DEMO_TRACE exec $VALGRIND '"$WD/anvil"')
+		#find /mnt/test -type f -print0 | xargs -0 ls -l
+		
+		# Allow custom commands
+		#(WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $HAND_TRACE exec $VALGRIND '"$WD/anvil"')
+		#find /mnt/test -type f -print0 | xargs -0 ls -l
+		
+		# Filter the system journal
+		true | (WD="`pwd`"; cd /mnt/test; ulimit -c unlimited; eval $IO_COUNT $OPROF $SYSJ_TRACE exec $VALGRIND '"$WD/anvil"')
+		ls -l /mnt/test/sys_journal*
+		
+		# If we comment out all the commands above, we
+		# need something here so bash doesn't complain
+		true
+	fi
+fi
+
+sudo umount /mnt/test
+if [ "$FSTYPE" == "ext2" ]
+then
+	echo "Unloading Featherstitch..."
+	time sudo rmmod kfstitchd
+fi
+
+echo -ne \\007
+
+sudo mount /dev/$DEV /mnt/test -t $FSTYPE
+rm -f gmon.out* gmon.sum*
+if [ -f /mnt/test/gmon.out ]
+then
+	echo -n "Processing gprof data... "
+	cp /mnt/test/gmon.out* .
+	for gmon in gmon.out*
+	do
+		gprof main $gmon > ${gmon/out/sum}
+	done
+	echo "done."
+fi
+for pgt in /mnt/test/*.pgt
+do
+	[ "$pgt" == "/mnt/test/*.pgt" ] && break
+	echo "Patchgroup trace: `basename "$pgt"`"
+	cp "$pgt" .
+done
+if [ -f /mnt/test/core ]
+then
+	echo "Starting debugger on core."
+	gdb -q -c /mnt/test/core main
+fi
+sudo umount /mnt/test

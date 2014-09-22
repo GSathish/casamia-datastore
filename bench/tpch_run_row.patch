@@ -1,0 +1,12 @@
+diff --git a/casamia-datastore-local b/casamia-datastore-local
+index cb64bbb..492e41b 100755
+--- a/casamia-datastore-local
++++ b/casamia-datastore-local
+@@ -22,6 +22,7 @@ echo -n "Creating test directory... "
+ rm -rf $DIR
+ mkdir -p $DIR/journals
+ ln -s "`pwd`/tpch" $DIR
++tar -C $DIR -xz < bench/lineitem-row.tar.gz
+ echo "done."
+ sync
+ 
